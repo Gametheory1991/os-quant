@@ -1,0 +1,17 @@
+name: "Value and Momentum Everywhere (ETF implementation)"
+paper: "Asness, Moskowitz & Pedersen (2013), Journal of Finance"
+universe: etfs
+signal:
+  value_window_months: 48      # 5y reversal window...
+  value_skip_months: 12        # ...ending 12m before formation (t-60..t-13)
+  momentum_window_months: 11   # 12-1 momentum (t-12..t-2)
+  momentum_skip_months: 1
+  legs_per_side: null          # null -> floor(N/3); 3 for N=11, 2 for FI sleeve
+  long_notional: 0.5
+  short_notional: 0.5
+  execution_lag_days: 1
+costs_bps: 10.0                # one-way, per unit turnover (liquid ETFs)
+borrow_bps_annual: 50.0        # borrow on short notional (assumption — see digest)
+benchmark: SPY                 # long-short market-neutral book vs equity market
+start: "2012-06-01"            # HYG (2007-04) + 5y value window
+fi_sleeve_start: "2009-01-01"  # FI ETFs all exist from <=2003 -> earlier start

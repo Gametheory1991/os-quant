@@ -1,0 +1,16 @@
+name: "FI Rates Time-Series Momentum (vol-targeted)"
+paper: "Moskowitz, Ooi & Pedersen (2012), Journal of Financial Economics"
+universe: etfs
+signal:
+  long_ticker: TLT
+  cash_ticker: SHY
+  momentum_window_months: 11   # 12-1 excess return
+  momentum_skip_months: 1
+  target_vol_annual: 0.10       # 10% vol target; null -> fixed +/-100%
+  max_leverage: 1.5
+  vol_window_days: 60
+  execution_lag_days: 1
+costs_bps: 5.0                 # Treasury ETFs: very liquid
+borrow_bps_annual: 0.0         # long/short outright, no stock borrow
+benchmark: blend_50_50_TLT_IEF # monthly-rebalanced; Bloomberg UST proxy
+start: "2003-08-01"            # TLT inception 2002-07 + 12m signal
