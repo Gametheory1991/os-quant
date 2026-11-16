@@ -22,8 +22,9 @@ import os
 import time
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yaml
@@ -136,18 +137,105 @@ def cache_path(ticker: str) -> Path:
     return CACHE_DIR / f"{ticker.upper()}.parquet"
 
 
+EASTERN = ZoneInfo("America/New_York")
+MARKET_CLOSE_MINUTES_ET = 16 * 60  # 16:00 ET
+
+
+def _guard_cache_frame(df: pd.DataFrame, ticker: str,
+                       now_et: datetime | None = None) -> pd.DataFrame:
+    """Strip bars that must never be persisted as a day's close.
+
+    Two rules, both learned from the 2026-10-16 incident (a 14:42 ET
+    mid-session fetch stored intraday snapshots as that day's closes for 41
+    tickers — e.g. ^VIX 21.50 vs the final 19.99):
+
+    - A bar whose close is NaN is dropped. Yahoo returns null closes for
+      sessions it has not finalized yet.
+    - Today's (America/New_York) bar is dropped when the fetch happens
+      before the 16:00 ET close — it is still in progress. A fetch during
+      market hours still returns (and may cache) the latest *completed* day.
+
+    Every stripped bar is logged at WARNING: a tripped guard is visible,
+    never a silent drop. Raises RuntimeError if nothing cacheable remains,
+    rather than overwriting a good cache with an empty frame.
+    """
+    if df.empty:
+        return df
+    nan_close = df["close"].isna()
+    if nan_close.any():
+        for d in df.index[nan_close]:
+            log.warning("cache guard: not caching %s %s — close is NaN",
+                        ticker, d.date())
+        df = df.loc[~nan_close]
+    if not df.empty:
+        now_et = now_et or datetime.now(EASTERN)
+        before_close = (now_et.hour * 60 + now_et.minute) < MARKET_CLOSE_MINUTES_ET
+        if before_close:
+            today_et = now_et.date()
+            in_progress = [d for d in df.index if d.date() == today_et]
+            for d in in_progress:
+                log.warning(
+                    "cache guard: not caching %s %s — fetched before the "
+                    "16:00 ET close, bar still in progress", ticker, d.date())
+            if in_progress:
+                df = df.loc[[d.date() != today_et for d in df.index]]
+    if df.empty:
+        raise RuntimeError(
+            f"cache guard: nothing cacheable for {ticker} after dropping "
+            "NaN / in-progress bars — refusing to write an empty cache")
+    return df
+
+
+def _missing_completed_weekdays(last_cached: date, today: date) -> list[date]:
+    """Weekdays strictly after ``last_cached`` and strictly before ``today``.
+
+    Each such weekday is a completed U.S. equity session whose final bar
+    Yahoo should already have published, so a cache that ends before one
+    is missing real data — not merely "a few calendar days old". (An
+    equity-market holiday weekday is the exception: it has no bar, so it
+    can trigger a refresh whose result changes nothing. That costs one
+    extra fetch and is the safe direction.)
+    """
+    out: list[date] = []
+    d = last_cached + timedelta(days=1)
+    while d < today:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
 def load_or_fetch(ticker: str, start: date | None = None,
                   end: date | None = None, refresh: bool = False) -> pd.DataFrame:
-    """Cached Yahoo daily bars. Refreshes when forced or when the cache does
-    not cover the requested end date (i.e. is more than ~1 trading day stale)."""
+    """Cached Yahoo daily bars. Refreshes when forced or when the cache is
+    missing any completed weekday session before the requested end date.
+
+    Staleness is judged in completed sessions, NOT calendar days. The
+    previous rule (refresh only when the cache was more than 3 calendar
+    days old) let a cache ending Monday ride through a Wednesday run —
+    Tuesday's bar was never fetched, and on 2026-10-21 the ML panel
+    builder reindexed the missing Tuesday (2026-10-20) onto the panel as
+    NaN, which made illiq_agg NaN and silently pinned ML issuance for
+    four consecutive runs. A weekend alone never makes a cache stale:
+    Friday -> Monday has no completed weekday in between.
+
+    Fetched bars pass through _guard_cache_frame before being written, so a
+    partial (in-progress or unfinalized) bar is never persisted as a close."""
     path = cache_path(ticker)
     if path.exists() and not refresh:
         df = pd.read_parquet(path)
         want_end = end or date.today()
-        if df.index[-1].date() >= want_end or (want_end - df.index[-1].date()).days <= 3:
+        last = df.index[-1].date()
+        if last >= want_end:
             return df
-        log.info("cache for %s stale (ends %s) — refreshing", ticker, df.index[-1].date())
+        missing = _missing_completed_weekdays(last, want_end)
+        if not missing:
+            return df
+        log.info("cache for %s stale (ends %s; missing completed sessions %s) "
+                 "— refreshing", ticker, last,
+                 ", ".join(str(d) for d in missing))
     df = fetch_yahoo_daily(ticker, start=start or date(1990, 1, 1), end=end)
+    df = _guard_cache_frame(df, ticker)
     df.to_parquet(path)
     return df
 

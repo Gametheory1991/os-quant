@@ -1,1 +1,1 @@
-"""Strategy implementations: pure signal-construction functions."""
+"""os-quant engine: data adapters, vectorized backtester, institutional stats."""
