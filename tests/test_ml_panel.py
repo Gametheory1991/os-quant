@@ -9,6 +9,29 @@ from engine import ml_panel as mp
 
 T_CUT = pd.Timestamp("2024-06-30")  # a Sunday: no partial refunding week
 
+# Floor for the standing panel: it only grows (daily updater), so tests
+# check "at least this much, and every row comes from the source file"
+# instead of an exact count that breaks on every legitimate extension.
+PANEL_MIN_ROWS = 849               # 2026-11-08 weekly roll-up
+PANEL_MIN_LAST_DAY = "2026-11-06"
+
+
+def _is_stub_holiday(d: pd.Timestamp) -> bool:
+    """SIFMA full-close days on which FINRA still publishes a near-empty
+    daily Treasury file: Columbus Day (second Monday of October) and
+    Veterans Day (Nov 11; observed Fri Nov 10 / Mon Nov 12 when it falls
+    on a weekend)."""
+    if d.month == 10 and d.weekday() == 0 and 8 <= d.day <= 14:
+        return True
+    if d.month == 11:
+        obs = pd.Timestamp(d.year, 11, 11)
+        if obs.weekday() == 5:
+            obs -= pd.Timedelta(days=1)
+        elif obs.weekday() == 6:
+            obs += pd.Timedelta(days=1)
+        return d.normalize() == obs
+    return False
+
 
 @pytest.fixture(scope="module")
 def built():
@@ -37,12 +60,16 @@ def test_panel_shape_and_range(panel):
     # Standing panel: grows via the daily updater (849 rows as of the
     # 2026-11-08 weekly roll-up; 834 as of the 2026-10-18 weekly
     # roll-up; 831 as of the 2026-10-13 standing-issuance unlock; was
-    # 824 at the Phase 0 build).
-    assert len(panel) == 849
+    # 824 at the Phase 0 build).  Assert a floor plus one row per source
+    # day, not an exact count, so a legitimate extension doesn't fail.
+    assert len(panel) >= PANEL_MIN_ROWS
+    assert len(panel) == len(mp.load_trace_daily())
     assert str(panel.index.min().date()) == "2023-02-14"
-    assert str(panel.index.max().date()) == "2026-11-06"
+    assert str(panel.index.max().date()) >= PANEL_MIN_LAST_DAY
     assert panel.index.is_monotonic_increasing
     assert not panel.index.duplicated().any()
+    # every row is a weekday (no weekend rows sneak in with an extension)
+    assert (panel.index.weekday < 5).all()
 
 
 def test_six_vector_semantics_known_day(fs):
@@ -76,9 +103,14 @@ def test_reconciliation_within_tolerance(panel, integrity):
 
 
 def test_holiday_stub_days(panel):
-    stubs = [str(d.date()) for d in panel.index[panel["is_holiday_stub"]]]
-    assert stubs == ["2024-10-14", "2024-11-11", "2025-10-13", "2025-11-11",
-                     "2026-10-12"]
+    stub_idx = panel.index[panel["is_holiday_stub"]]
+    stubs = [str(d.date()) for d in stub_idx]
+    # the known stubs stay stubs ...
+    assert {"2024-10-14", "2024-11-11", "2025-10-13", "2025-11-11",
+            "2026-10-12"} <= set(stubs)
+    # ... and any new stub must fall on Columbus or Veterans Day, so a
+    # bad near-empty row on an ordinary day still fails here
+    assert all(_is_stub_holiday(d) for d in stub_idx), stubs
     assert (panel.loc[panel["is_holiday_stub"], "adv_total_reported"] < 1.0).all()
 
 
@@ -105,10 +137,12 @@ def test_illiq_formula(fs):
 
 
 def test_illiq_nan_only_where_expected(fs):
-    # 5 holiday stubs (incl. 2026-10-12, added when the panel extended)
+    # NaN exactly on the holiday stubs (which grow by about two a year)
     # + 2025-01-09 (NYSE closed for the Carter national day of mourning;
     # bond market open, so no ETF return exists)
-    assert int(fs["illiq_agg"].isna().sum()) == 6
+    nan_days = set(fs.index[fs["illiq_agg"].isna()])
+    stub_days = set(fs.index[fs["is_holiday_stub"]])
+    assert nan_days == stub_days | {pd.Timestamp("2025-01-09")}
     assert pd.isna(fs.loc["2025-01-09", "illiq_agg"])
     assert fs.loc[fs["is_holiday_stub"], "illiq_agg"].isna().all()
 
